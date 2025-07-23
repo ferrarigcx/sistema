@@ -1,14 +1,14 @@
-import sqlite3
 import hashlib
 import os
 import time
+import subprocess
 
 # --- ÁREA DE CONFIGURAÇÃO ---
 
 # 1. Coloque aqui o caminho COMPLETO para a pasta onde o YOLO salva os vídeos.
 #    Lembre-se de usar o formato do Linux (WSL).
 #    Exemplo: "/mnt/c/Users/SeuNome/Desktop/videos_nao_conformes"
-PASTA_DE_VIDEOS = "sistema/trechos_nao_conformes"
+PASTA_DE_VIDEOS = "../trechos_nao_conformes"
 
 # 2. Nome do arquivo do banco de dados que será criado para guardar os hashes.
 DB_FILE = "registros_offchain.db"
@@ -18,22 +18,6 @@ EXTENSOES_VIDEO = ('.mp4', '.avi', '.mov', '.mkv')
 
 # --------------------------
 
-def inicializar_db():
-    """Cria o banco de dados e a tabela se eles não existirem."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    # A coluna 'nome_arquivo' será única para evitar duplicatas.
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS nao_conformidades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nome_arquivo TEXT NOT NULL UNIQUE,
-            hash_video TEXT NOT NULL,
-            status TEXT NOT NULL,
-            timestamp_processamento DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
 
 def calcular_hash_video(caminho_do_video):
     """Calcula o hash SHA-256 de um arquivo de vídeo."""
@@ -49,42 +33,15 @@ def calcular_hash_video(caminho_do_video):
         print(f"‼️  Erro ao ler o arquivo {os.path.basename(caminho_do_video)}: {e}")
         return None
 
-def arquivo_ja_processado(nome_arquivo):
-    """Verifica no DB se um arquivo com este nome já foi salvo. Retorna True ou False."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM nao_conformidades WHERE nome_arquivo = ?", (nome_arquivo,))
-    data = cursor.fetchone()
-    conn.close()
-    return data is not None
-
-def salvar_hash_no_db(nome_arquivo, hash_video):
-    """Salva o nome do arquivo e seu hash no banco de dados SQLite."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    try:
-        # O status 'PENDENTE' significa que o hash foi salvo localmente (off-chain)
-        # mas ainda está pendente para ser enviado para a Blockchain.
-        cursor.execute(
-            "INSERT INTO nao_conformidades (nome_arquivo, hash_video, status) VALUES (?, ?, ?)",
-            (nome_arquivo, hash_video, 'PENDENTE')
-        )
-        conn.commit()
-        print(f"✅ Hash para '{nome_arquivo}' salvo com sucesso no banco de dados.")
-    except sqlite3.IntegrityError:
-        # Esta é uma segurança extra, mas a função arquivo_ja_processado já deve prevenir isso.
-        print(f"⚠️  Atenção: O arquivo '{nome_arquivo}' já existia no banco de dados.")
-    finally:
-        conn.close()
 
 # --- PONTO DE PARTIDA DO SCRIPT ---
 if __name__ == "__main__":
-    print("--- 🏛️  Iniciando Guardião de Hashes (Processador Off-Chain) ---")
-    time.sleep(1)
-
-    # Garante que o banco de dados e a tabela existem.
-    inicializar_db()
-
+    contract = os.path.join("../besu/smart_contracts/scripts/public", "deploy.js")
+    value = os.path.join("../besu/smart_contracts/scripts/public", "hre_hash.js")
+    contract_number = ""
+    
+       
+  
     # Pega a lista de todos os arquivos na pasta de vídeos.
     try:
         arquivos_na_pasta = os.listdir(PASTA_DE_VIDEOS)
@@ -101,20 +58,44 @@ if __name__ == "__main__":
         print(f"🔎 Encontrados {len(videos_encontrados)} vídeos na pasta. Verificando...")
 
     novos_arquivos_processados = 0
+
+    if(contract_number==""):
+        result = subprocess.run(['node', contract], capture_output=True, text=True, check=True)
+        node_output = result.stdout.strip() # .strip() removes leading/trailing whitespace, including newlines
+        contract_number = node_output
+        print(f" Criado o contrato no endereço {node_output}")
+   
     # Itera sobre cada arquivo de vídeo encontrado.
     for nome_arquivo in videos_encontrados:
-        # Verifica se o arquivo já foi processado antes para não repetir o trabalho.
-        if arquivo_ja_processado(nome_arquivo):
-            continue
+    
         
         # Se for um arquivo novo, processa.
         print(f"\n📥 Novo arquivo detectado: '{nome_arquivo}'.")
         caminho_completo = os.path.join(PASTA_DE_VIDEOS, nome_arquivo)
         
         hash_calculado = calcular_hash_video(caminho_completo)
+
+     
         
         if hash_calculado:
-            salvar_hash_no_db(nome_arquivo, hash_calculado)
+             # Executa script.js com Node.js
+            try:
+                # Run the Node.js script
+                # The `text=True` argument decodes stdout/stderr as text
+                # The `check=True` argument raises a CalledProcessError if the command returns a non-zero exit code
+              
+                result = subprocess.run(['node', value, contract_number,hash_calculado], capture_output=True, text=True, check=True)
+                node_output = result.stdout.strip() # .strip() removes leading/trailing whitespace, including newlines
+                contract_number = node_output
+                print(f" Dado enviado a blockchain {node_output}")
+                # The output is in result.stdout
+                
+            except subprocess.CalledProcessError as e:
+                print(f"Error running Node.js script: {e}")
+                print(f"Stderr: {e.stderr}")
+            except FileNotFoundError:
+                print("Error: 'node' command not found. Make sure Node.js is installed and in your system's PATH.")
+                print("Saída do JS:", result.stdout)
             novos_arquivos_processados += 1
 
     print("\n--- Processamento Concluído ---")
@@ -122,3 +103,4 @@ if __name__ == "__main__":
         print(f"🎉 Resumo: {novos_arquivos_processados} nova(s) não conformidade(s) foram processadas e salvas.")
     else:
         print("👍 Nenhum arquivo novo para processar. O banco de dados já está atualizado.")
+
