@@ -1,8 +1,4 @@
-<<<<<<< HEAD
 
-=======
----
->>>>>>> master
 x-besu-def:
   &besu-def
   restart: "on-failure"
@@ -22,15 +18,7 @@ x-besu-def:
       --rpc-http-api=EEA,WEB3,ETH,NET,TRACE,DEBUG,ADMIN,TXPOOL,PERM,${BESU_CONS_ALGO:-QBFT} \
       --rpc-ws-api=EEA,WEB3,ETH,NET,TRACE,DEBUG,ADMIN,TXPOOL,PERM,${BESU_CONS_ALGO:-QBFT} ;
 
-<<<<<<< HEAD
 
-
-
-
-
-
-=======
->>>>>>> master
 x-blockscout-ref:
   &blockscout-def
   image: consensys/blockscout:v4.1.5-beta
@@ -111,8 +99,8 @@ services:
     << : *besu-def
     ports:
       - 21001:8545/tcp
-      - 30303
-      - 9545
+      - 30303:30303
+      - 9545:9545
     environment:
       - OTEL_RESOURCE_ATTRIBUTES=service.name=validator1,service.version=${BESU_VERSION:-latest}
     labels:
@@ -259,11 +247,8 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
     ports:
-<<<<<<< HEAD
       - 9091:9090/tcp
-=======
-      - 9090:9090/tcp
->>>>>>> master
+   
     networks:
       quorum-dev-quickstart:
         ipv4_address: 172.16.239.32
