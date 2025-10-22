@@ -21,32 +21,23 @@ async function set(provider, wallet, deployedContractAbi, deployedContractAddres
   const tx = await contractWithSigner.saveHash(value);
   // verify the updated value
   await tx.wait();
-  // const res = await contract.get();
-  // console.log("Obtained value at deployed contract is: "+ res);
-  return tx;
+  console.log(tx);
 }
 
-async function createContract(wallet, contractAbi, contractByteCode) {
-  const factory = new ethers.ContractFactory(contractAbi, contractByteCode, wallet);
-  const contract = await factory.deploy();
-  // The contract is NOT deployed yet; we must wait until it is mined
-  const deployed = await contract.waitForDeployment();
-  //The contract is deployed now
-  return contract
-};
-
 async function main(value, contract) {
+
   const provider = new ethers.JsonRpcProvider(host);
   const wallet = new ethers.Wallet(accountPrivateKey, provider);
   const args = process.argv.slice(2);
-
-
+  
   try {
-
+    
     await set(provider, wallet, contractAbi, contract, value);
-    // await getAllPastEvents(host, contractAbi, tx.contractAddress);
+  
   } catch (error) {
+  
     console.error;
+  
   }
 
 

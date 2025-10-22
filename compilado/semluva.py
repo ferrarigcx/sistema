@@ -5,9 +5,9 @@ from datetime import datetime
 from pathlib import Path
 
 # Configurações
-MODEL_PATH = 'modelo_treinadov2.1 (1).pt'
-VIDEO_FOLDER = 'videos'  # Pasta com vídeos para processar
-SAVE_FOLDER = 'trechos_nao_conformes'
+MODEL_PATH = '../modelo_treinadov2.1 (1).pt'
+VIDEO_FOLDER = '../videos'  # Pasta com vídeos para processar
+SAVE_FOLDER = '../trechos_nao_conformes'
 NAO_CONFORME_CLASS = 'sem luva'
 TRECHO_DURACAO = 5  # segundos
 FPS_PAD = 5  # margem de segurança antes/depois do trecho

@@ -4,17 +4,18 @@ import os
 import time
 
 # --- ÁREA DE CONFIGURAÇÃO ---
-
+inicio = time.time()
 # 1. Coloque aqui o caminho COMPLETO para a pasta onde o YOLO salva os vídeos.
 #    Lembre-se de usar o formato do Linux (WSL).
 #    Exemplo: "/mnt/c/Users/SeuNome/Desktop/videos_nao_conformes"
-PASTA_DE_VIDEOS = "trechos_nao_conformes"
+PASTA_DE_VIDEOS = "../trechos_nao_conformes"
 
 # 2. Nome do arquivo do banco de dados que será criado para guardar os hashes.
 DB_FILE = "registros_offchain.db"
 
 # 3. Extensões de vídeo que o script deve procurar.
 EXTENSOES_VIDEO = ('.mp4', '.avi', '.mov', '.mkv')
+
 
 # --------------------------
 
@@ -122,3 +123,8 @@ if __name__ == "__main__":
         print(f"🎉 Resumo: {novos_arquivos_processados} nova(s) não conformidade(s) foram processadas e salvas.")
     else:
         print("👍 Nenhum arquivo novo para processar. O banco de dados já está atualizado.")
+        
+    # --- CRONÔMETRO ---
+    fim = time.time()
+    duracao_segundos = fim - inicio
+    print(f"\n⏱️  Tempo total de execução do script: {duracao_segundos:.2f} segundos.")
