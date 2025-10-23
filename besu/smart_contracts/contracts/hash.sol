@@ -17,3 +17,7 @@ contract HashStorage {
         emit video(_hash);
     }
 }
+
+mapping(bytes32 => bool) public hashExists;
+function register(bytes32 h) external { require(!hashExists[h], "DUPLICATE"); hashExists[h] = true; /* ... */ }
+function existsHash(bytes32 h) external view returns (bool) { return hashExists[h]; }
