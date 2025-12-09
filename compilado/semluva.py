@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 # Configurações
-MODEL_PATH = '../modelo_treinadov2.1 (1).pt'
+MODEL_PATH = '../ModeloTreinadoV3.pt'
 VIDEO_FOLDER = '../videos'  # Pasta com vídeos para processar
 SAVE_FOLDER = '../trechos_nao_conformes'
 NAO_CONFORME_CLASS = 'sem luva'
