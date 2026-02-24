@@ -24,27 +24,23 @@ async function set(provider, wallet, deployedContractAbi, deployedContractAddres
   console.log(tx);
 }
 
-async function main(value, contract) {
+async function main() {
 
   const provider = new ethers.JsonRpcProvider(host);
   const wallet = new ethers.Wallet(accountPrivateKey, provider);
   const args = process.argv.slice(2);
-  
-  try {
-    
-    await set(provider, wallet, contractAbi, contract, value);
-  
-  } catch (error) {
-  
-    console.error;
-  
-  }
 
+  await set(provider, wallet, contractAbi, args[1], args[0]);
 
 }
 
 if (require.main === module) {
-  main();
+  main()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error("Unhandled error:", err);
+      process.exit(1);
+    });
 }
 
 module.exports = exports = main
