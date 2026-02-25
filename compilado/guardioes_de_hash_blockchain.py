@@ -86,6 +86,7 @@ def procura_hash(contract_number,file_hash) -> bool:
 
     
 def inserirblockchain(contract_address, file_hash) : 
+     
      result = subprocess.run(['node', HRE_HASH_JS,  file_hash, contract_number],
                                     capture_output=True, text=True, check=True)
      node_output = result.stdout.strip()
@@ -159,6 +160,7 @@ if __name__ == "__main__":
         try:
           
             if(procura_hash(contract_number,file_hash)==False):
+               
                 inserirblockchain(contract_number, file_hash)
                 novos_arquivos_processados += 1
 
