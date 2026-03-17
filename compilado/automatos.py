@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +19,10 @@ HRE_FOUND_JS = SCRIPTS_DIR / "hre_found.js"
 PADRAO_ENDERECO = re.compile(r"^0x[0-9a-fA-F]{40}$")
 FRAME_OUTPUT_PATH_STR = os.getenv("AUTOMATOS_FRAME_PATH", "").strip()
 FRAME_OUTPUT_PATH: Optional[Path] = None
+TRECHOS_DIR = BASE_DIR / "trechos_nao_conformes"
+PRE_EVENT_SECONDS = float(os.getenv("NC_PRE_SECONDS", "5"))
+POST_EVENT_SECONDS = float(os.getenv("NC_POST_SECONDS", "5"))
+MAX_EVENT_SECONDS = float(os.getenv("NC_MAX_SECONDS", "20"))
 if FRAME_OUTPUT_PATH_STR:
     try:
         FRAME_OUTPUT_PATH = Path(FRAME_OUTPUT_PATH_STR)
@@ -77,6 +82,173 @@ def area(box) -> float:
     return max(0.0, x2 - x1) * max(0.0, y2 - y1)
 
 
+def _normalizar_label(label) -> str:
+    texto = str(label or "").strip().lower()
+    texto = texto.replace("_", " ")
+    texto = " ".join(texto.split())
+    if texto == "com luva":
+        return "mao com luva"
+    if texto == "sem luva":
+        return "mao sem luva"
+    return texto
+
+
+def _normalizar_objetos(objetos) -> list[str]:
+    return [_normalizar_label(obj) for obj in (objetos or [])]
+
+
+def detectar_nao_conformidade_critica(objetos) -> Optional[str]:
+    objetos_norm = _normalizar_objetos(objetos)
+    tem_sem_luva = "mao sem luva" in objetos_norm
+    tem_ativimetro = "ativimetro" in objetos_norm
+    if tem_sem_luva and not tem_ativimetro:
+        return "mao sem luva e ativimetro ausente"
+    if tem_sem_luva:
+        return "mao sem luva"
+    if not tem_ativimetro:
+        return "ativimetro ausente"
+    return None
+
+
+class NonConformityClipper:
+    def __init__(
+        self,
+        source_path: Optional[Path],
+        fps: float,
+        blockchain_client: Optional["BlockchainClient"],
+        output_dir: Path = TRECHOS_DIR,
+        pre_seconds: float = PRE_EVENT_SECONDS,
+        post_seconds: float = POST_EVENT_SECONDS,
+        max_seconds: float = MAX_EVENT_SECONDS,
+    ):
+        self.source_path = source_path if source_path and source_path.is_file() else None
+        self.output_dir = output_dir
+        self.pre_seconds = max(0.0, pre_seconds)
+        self.post_seconds = max(0.0, post_seconds)
+        self.max_seconds = max(1.0, max_seconds)
+        self.fps = fps if fps and fps > 0 else 30.0
+        self.blockchain_client = blockchain_client if blockchain_client and blockchain_client.enabled else None
+        self.recent_frames = deque()
+        self.event_open = False
+        self.event_reason = ""
+        self.event_reasons = set()
+        self.event_frames = []
+        self.last_active_ts = 0.0
+        self.last_event_start_ts = 0.0
+        self._last_appended_ts = None
+
+        self.enabled = self.source_path is not None
+        if self.enabled:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self._log(
+                f"recorte ativo para '{self.source_path.name}' com janela {self.pre_seconds:.1f}s antes, {self.post_seconds:.1f}s depois e maximo de {self.max_seconds:.1f}s por trecho"
+            )
+        else:
+            self._log("recorte de trechos desativado para esta fonte.")
+
+    def _log(self, msg: str) -> None:
+        print(f"[trechos] {msg}")
+
+    def _sanitize_label(self, value: str) -> str:
+        texto = _normalizar_label(value)
+        texto = texto.replace(" ", "_")
+        texto = re.sub(r"[^a-z0-9_]+", "", texto)
+        return texto or "nao_conformidade"
+
+    def _append_recent(self, timestamp_sec: float, frame) -> None:
+        frame_copy = frame.copy()
+        self.recent_frames.append((timestamp_sec, frame_copy))
+        cutoff = timestamp_sec - self.pre_seconds
+        while self.recent_frames and self.recent_frames[0][0] < cutoff:
+            self.recent_frames.popleft()
+
+    def _append_event_frame(self, timestamp_sec: float, frame) -> None:
+        if self._last_appended_ts is not None and timestamp_sec <= self._last_appended_ts:
+            return
+        self.event_frames.append((timestamp_sec, frame.copy()))
+        self._last_appended_ts = timestamp_sec
+
+    def _start_event(self, timestamp_sec: float, reason: str) -> None:
+        self.event_open = True
+        self.event_reason = reason
+        self.event_reasons = {reason}
+        self.last_active_ts = timestamp_sec
+        self.last_event_start_ts = timestamp_sec
+        self.event_frames = [(ts, frm.copy()) for ts, frm in self.recent_frames]
+        self._last_appended_ts = self.event_frames[-1][0] if self.event_frames else None
+        self._log(f"iniciando gravacao do trecho em {timestamp_sec:.2f}s por motivo: {reason}")
+
+    def _save_event(self) -> Optional[Path]:
+        import cv2
+
+        if not self.event_frames:
+            return None
+        first_frame = self.event_frames[0][1]
+        if first_frame is None:
+            return None
+        height, width = first_frame.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        reason_slug = self._sanitize_label("_".join(sorted(self.event_reasons)))
+        start_tag = int(max(0.0, self.last_event_start_ts) * 1000)
+        source_stem = self._sanitize_label(self.source_path.stem if self.source_path else "fonte")
+        output_path = self.output_dir / f"trecho_{source_stem}_{reason_slug}_{start_tag}.mp4"
+        writer = cv2.VideoWriter(str(output_path), fourcc, self.fps, (width, height))
+        if not writer.isOpened():
+            self._log(f"falha ao abrir writer para '{output_path.name}'")
+            return None
+        try:
+            for _, frame in self.event_frames:
+                writer.write(frame)
+        finally:
+            writer.release()
+        self._log(f"trecho salvo em '{output_path.name}' com {len(self.event_frames)} frames")
+        return output_path
+
+    def _close_event(self) -> None:
+        output_path = self._save_event()
+        if output_path and self.blockchain_client:
+            descricao = f"Trecho nao conforme: {', '.join(sorted(self.event_reasons))}"
+            self.blockchain_client.register_file(output_path, descricao)
+        self.event_open = False
+        self.event_reason = ""
+        self.event_reasons = set()
+        self.event_frames = []
+        self._last_appended_ts = None
+
+    def _rotate_event(self, timestamp_sec: float, frame, reason: Optional[str]) -> None:
+        self._log(f"duracao maxima de {self.max_seconds:.1f}s atingida; salvando trecho e iniciando novo.")
+        self._close_event()
+        if reason:
+            self._start_event(timestamp_sec, reason)
+            self._append_event_frame(timestamp_sec, frame)
+
+    def ingest(self, timestamp_sec: float, frame, reason: Optional[str]) -> None:
+        if not self.enabled:
+            return
+        self._append_recent(timestamp_sec, frame)
+        if reason and not self.event_open:
+            self._start_event(timestamp_sec, reason)
+        if self.event_open:
+            if reason:
+                if reason not in self.event_reasons:
+                    self._log(f"gravacao em andamento; novo motivo detectado: {reason}")
+                self.event_reasons.add(reason)
+                self.last_active_ts = timestamp_sec
+            self._append_event_frame(timestamp_sec, frame)
+            if timestamp_sec - self.last_event_start_ts >= self.max_seconds:
+                self._rotate_event(timestamp_sec, frame, reason)
+                return
+            if (not reason) and (timestamp_sec - self.last_active_ts >= self.post_seconds):
+                self._log(f"nao conformidade encerrada em {timestamp_sec:.2f}s")
+                self._close_event()
+
+    def finish(self) -> None:
+        if not self.enabled or not self.event_open:
+            return
+        self._log("fim do video com nao conformidade ainda aberta; salvando trecho final.")
+        self._close_event()
+
+
 class BlockchainClient:
     """Integração simples com os scripts Node para registrar hashes na blockchain."""
 
@@ -85,9 +257,6 @@ class BlockchainClient:
         self.source_input = (source or "").strip()
         self.source_path = self._resolve_source(self.source_input)
         self.contract_address = self._buscar_endereco()
-        self.file_hash = None
-        self._already_registered = False
-        self._checked = False
         self.enabled = False
 
         if not self.contract_address:
@@ -100,15 +269,8 @@ class BlockchainClient:
             self._log("Scripts hre_hash.js/hre_found.js não encontrados.")
             return
 
-        self.file_hash = self._calcular_hash(self.source_path)
-        if not self.file_hash:
-            self._log("Falha ao calcular hash do arquivo. Integração desativada.")
-            return
-
         self.enabled = True
-        self._log(
-            f"pronto. contrato={self.contract_address} arquivo='{self.source_path.name}' hash={self.file_hash[:12]}..."
-        )
+        self._log(f"pronto. contrato={self.contract_address} arquivo='{self.source_path.name}'")
 
     def _log(self, msg: str) -> None:
         print(f"[blockchain] {msg}")
@@ -125,13 +287,13 @@ class BlockchainClient:
         return None
 
     def _buscar_endereco(self) -> str:
-        for txt in self.base_dir.glob("*.txt"):
-            try:
-                conteudo = txt.read_text(encoding="utf-8").strip()
-                if PADRAO_ENDERECO.match(conteudo):
-                    return conteudo
-            except Exception:
-                continue
+        arquivo = self.base_dir / "contract_address.txt"
+        try:
+            conteudo = arquivo.read_text(encoding="utf-8").strip()
+            if PADRAO_ENDERECO.match(conteudo):
+                return conteudo
+        except Exception:
+            pass
         return ""
 
     def _calcular_hash(self, path: Path) -> Optional[str]:
@@ -157,41 +319,45 @@ class BlockchainClient:
             self._log(f"falha ao executar '{script.name}': {exc}; stderr={exc.stderr}")
         return None
 
-    def _check_registered(self) -> bool:
+    def _check_registered(self, file_hash: str) -> bool:
         if not self.enabled:
             return False
-        out = self._run_node(HRE_FOUND_JS, self.file_hash, self.contract_address)
+        out = self._run_node(HRE_FOUND_JS, file_hash, self.contract_address)
         if out is None:
+            self._log("verificação on-chain sem resposta válida.")
             return False
+        self._log(f"verificação on-chain retornou: '{out}'")
         low = out.lower()
         if low in {"true", "false"}:
             return low == "true"
         if re.fullmatch(r"0x[0-9a-fA-F]{64}", out):
-            return out.lower() == self.file_hash.lower()
+            return out.lower() == file_hash.lower()
         return False
 
-    def _enviar_para_blockchain(self) -> bool:
+    def _enviar_para_blockchain(self, file_hash: str) -> bool:
         if not self.enabled:
             return False
-        out = self._run_node(HRE_HASH_JS, self.file_hash, self.contract_address)
+        out = self._run_node(HRE_HASH_JS, file_hash, self.contract_address)
         if out is None:
             return False
         self._log(f"hash enviado. resposta: {out[:120]}")
         return True
 
-    def reportar_nao_conformidade(self, registro: dict) -> None:
+    def register_file(self, path: Path, descricao: str) -> bool:
         if not self.enabled:
-            return
-        descricao = registro.get("mensagem", "Não conformidade detectada")
-        self._log(f"registrando evento: {descricao}")
-        if not self._checked:
-            self._already_registered = self._check_registered()
-            self._checked = True
-        if self._already_registered:
-            self._log("hash já presente no contrato. Nenhum envio necessário.")
-            return
-        if self._enviar_para_blockchain():
-            self._already_registered = True
+            return False
+        file_hash = self._calcular_hash(path)
+        if not file_hash:
+            self._log(f"falha ao calcular hash para '{path.name}'")
+            return False
+        self._log(f"registrando arquivo '{path.name}' para evento: {descricao}")
+        if self._check_registered(file_hash):
+            self._log("hash do trecho já estava presente no contrato. Nenhum envio necessário.")
+            return False
+        return self._enviar_para_blockchain(file_hash)
+
+    def reportar_nao_conformidade(self, registro: dict) -> None:
+        return
 
 class AFNRefinado:
     def __init__(self, audit_mode: bool = False, blockchain_client: Optional[BlockchainClient] = None):
@@ -203,24 +369,31 @@ class AFNRefinado:
         self.blockchain_client = blockchain_client
 
     def verificar_erro_critico(self, objetos, boxes=None):
-        crit = "Sem_Luva" in objetos or "Ativimetro" not in objetos
+        objetos_norm = _normalizar_objetos(objetos)
+        tem_sem_luva = "mao sem luva" in objetos_norm
+        tem_ativimetro = "ativimetro" in objetos_norm
+        crit = tem_sem_luva or not tem_ativimetro
         if crit:
-            # Registra imediatamente o erro crítico
-            self._registrar_nao_conformidade(
-                "critical", objetos, boxes, "Erro crítico: mão sem luva ou ativímetro ausente"
-            )
+            if tem_sem_luva and not tem_ativimetro:
+                mensagem = "Erro critico: mao sem luva e ativimetro ausente"
+            elif tem_sem_luva:
+                mensagem = "Erro critico: mao sem luva"
+            else:
+                mensagem = "Erro critico: ativimetro ausente"
+            self._registrar_nao_conformidade("critical", objetos_norm, boxes, mensagem)
         return crit
 
     def mapear_entrada(self, objetos, boxes, nomes):
+        objetos_norm = _normalizar_objetos(objetos)
         if self.estado_atual == "q0":
-            return "tem_mao" if "Com_Luva" in objetos else ""
+            return "tem_mao" if "mao com luva" in objetos_norm else ""
 
         if self.estado_atual == "q1":
-            return "com_luva" if "Com_Luva" in objetos else ""
+            return "com_luva" if "mao com luva" in objetos_norm else ""
 
         if self.estado_atual == "q2":
-            has_cesta = any("cesta" in str(o).lower() for o in objetos)
-            has_amostra = any("amostra" in str(o).lower() for o in objetos)
+            has_cesta = any("cesta" in obj for obj in objetos_norm)
+            has_amostra = any("amostra" in obj for obj in objetos_norm)
             if has_cesta and has_amostra:
                 return "cesta_dentro"
             return ""
@@ -232,17 +405,17 @@ class AFNRefinado:
             #  - fallback por centro-dentro e por fração de cobertura da amostra.
             box_amostras = []
             box_cestas = []
-            for i, nome in enumerate(objetos):
+            for i, nome in enumerate(objetos_norm):
                 if i >= len(boxes):
                     continue
                 b = boxes[i]
-                if nome == "Amostra":
+                if nome == "amostra":
                     box_amostras.append(b)
-                elif nome == "Cesta":
+                elif nome == "cesta":
                     box_cestas.append(b)
 
             # Aceita rótulos compostos detectados pelo modelo (qualquer label contendo ambas as palavras)
-            for lbl in objetos:
+            for lbl in objetos_norm:
                 l = str(lbl).strip().lower()
                 if ("cesta" in l) and ("amostra" in l):
                     return "amostra_dentro_cesta"
@@ -268,11 +441,11 @@ class AFNRefinado:
             box_amostra = None
             box_ativimetro = None
 
-            for i, nome in enumerate(objetos):
+            for i, nome in enumerate(objetos_norm):
                 box = boxes[i]
-                if nome == "Amostra":
+                if nome == "amostra":
                     box_amostra = box
-                elif nome == "Ativimetro":
+                elif nome == "ativimetro":
                     box_ativimetro = box
 
             if box_amostra and box_ativimetro:
@@ -300,7 +473,7 @@ class AFNRefinado:
                 "state": self.estado_atual,
                 "prev_state": self.estado_anterior,
                 "ts": time.time(),
-                "objetos": list(objetos) if objetos is not None else [],
+                "objetos": _normalizar_objetos(objetos),
                 "boxes": boxes,
             }
             self.erros_acumulados.append(registro)
@@ -425,14 +598,11 @@ def _gen_from_image(model, path):
     names = r0.names
     boxes = r0.boxes.xyxy.cpu().tolist() if r0.boxes is not None else []
     classes = r0.boxes.cls.tolist() if r0.boxes is not None else []
-    objetos = [names[int(i)] for i in classes]
-    # Sinaliza presença de mão quando houver luva ou sem luva
-    if ("com luva" in objetos) or ("sem luva" in objetos):
-        objetos = list(set(objetos + ["mão"]))
+    objetos = _normalizar_objetos([names[int(i)] for i in classes])
     return [(objetos, boxes)]
 
 
-def _stream_from_capture(model, cap, afn):
+def _stream_from_capture(model, cap, afn, clipper: Optional[NonConformityClipper] = None):
     import cv2
     import numpy as np
     WIN = "YOLO + AFN"
@@ -488,8 +658,8 @@ def _stream_from_capture(model, cap, afn):
             "amostra": (0, 255, 255),
             "cesta": (255, 165, 0),
             "ativimetro": (0, 128, 255),
-            "com_luva": (0, 255, 0),
-            "sem_luva": (0, 0, 255),
+            "mao com luva": (0, 255, 0),
+            "mao sem luva": (0, 0, 255),
         }
         if not (SHOW_GUI or frame_output_path):
             return img
@@ -526,10 +696,14 @@ def _stream_from_capture(model, cap, afn):
         return img
 
     warned_fallback = False
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = fps if fps and fps > 0 else 30.0
+    frame_index = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
+        frame_index += 1
         try:
             res = model.track(frame, persist=True, verbose=False)
         except Exception as e:
@@ -546,12 +720,12 @@ def _stream_from_capture(model, cap, afn):
         names = r0.names
         boxes = r0.boxes.xyxy.cpu().tolist() if r0.boxes is not None else []
         classes = r0.boxes.cls.tolist() if r0.boxes is not None else []
-        objetos = [names[int(i)] for i in classes]
-        # Sinaliza presença de mão quando houver luva ou sem luva
-        if ("com luva" in objetos) or ("sem luva" in objetos):
-            if "mão" not in objetos:
-                objetos.append("mão")
-
+        objetos = _normalizar_objetos([names[int(i)] for i in classes])
+        timestamp_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
+        timestamp_sec = (timestamp_msec / 1000.0) if timestamp_msec and timestamp_msec > 0 else (frame_index / fps)
+        critical_reason = detectar_nao_conformidade_critica(objetos)
+        if clipper:
+            clipper.ingest(timestamp_sec, frame, critical_reason)
         r = afn.processar(objetos, boxes, objetos)
         if r == "fim":
             print("[info] Autômato finalizado. Saindo do loop de captura.")
@@ -571,6 +745,8 @@ def _stream_from_capture(model, cap, afn):
                 pass
 
     try:
+        if clipper:
+            clipper.finish()
         cap.release()
         if SHOW_GUI:
             import cv2 as _cv
@@ -594,15 +770,14 @@ def main():
 
     base_dir = os.path.dirname(__file__)
     blockchain_client = BlockchainClient(BASE_DIR, args.source)
-    bc = blockchain_client if blockchain_client.enabled else None
-    afn = AFNAuditoria2(blockchain_client=bc) if _audit else AFNRefinado(blockchain_client=bc)
+    afn = AFNAuditoria2(blockchain_client=None) if _audit else AFNRefinado(blockchain_client=None)
 
     if args.simulate:
         print("Usando modo simulado legado.")
         # Pequena simulação mínima só para manter compatibilidade
         palavras = [
-            (["mão", "ativimetro"], [[0, 0, 100, 100], [300, 300, 400, 400]]),
-            (["com luva", "ativimetro"], [[0, 0, 100, 100], [300, 300, 400, 400]]),
+            (["mao sem luva", "ativimetro"], [[0, 0, 100, 100], [300, 300, 400, 400]]),
+            (["mao com luva", "ativimetro"], [[0, 0, 100, 100], [300, 300, 400, 400]]),
             (["cesta", "amostra", "ativimetro"], [[50, 50, 100, 100], [70, 70, 110, 110], [300, 300, 400, 400]]),
             # A partir daqui, q3 vai validar se amostra está dentro da cesta via boxes
             (["amostra", "cesta", "ativimetro"], [[60, 60, 100, 100], [50, 50, 120, 120], [300, 300, 400, 400]]),
@@ -652,7 +827,22 @@ def main():
         print(f"Não foi possível abrir a fonte: {src}")
         return
 
-    _stream_from_capture(modelo, cap, afn)
+    clipper = None
+    clip_source_path = None
+    if not src.isdigit():
+        cand = Path(src)
+        if not cand.is_absolute():
+            cand = BASE_DIR / cand
+        if cand.exists() and cand.is_file():
+            clip_source_path = cand
+
+    if clip_source_path is not None:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        clipper = NonConformityClipper(clip_source_path, fps, blockchain_client)
+    else:
+        print("[trechos] extração automática disponível apenas para vídeos em arquivo nesta versão.")
+
+    _stream_from_capture(modelo, cap, afn, clipper)
 
 
 if __name__ == "__main__":

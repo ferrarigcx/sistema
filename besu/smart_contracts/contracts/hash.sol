@@ -12,9 +12,14 @@ contract HashStorage {
         bytes32 indexed storedHash
     );
 
-    function saveHash(bytes32 _hash) public {
+    event issue(
+        string indexed _issue_i
+    )
+
+    function saveHash(bytes32 _hash, string _issue_i) public {
         storedHash = _hash;
         emit video(_hash);
+        emit issue(_issue_i)
     }
 }
 

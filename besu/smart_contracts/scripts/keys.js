@@ -21,7 +21,7 @@ module.exports = {
         "0e93a540518eeb673d94fb496b746008ab56605463cb9212493997f5755124d1",
       accountAddress: "c9c913c8c3c1cd416d80a0abf475db2062f161f6",
       accountPrivateKey:
-        "0x60bbe10a196a4e71451c0f6e9ec9beab454c2a5ac0542aa5b8b733ff5719fec3",
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
     },
     member1: {
       name: "member1",
@@ -43,7 +43,7 @@ module.exports = {
         "f18166704e19b895c1e2698ebc82b4e007e6d2933f4b31be23662dd0ec602570",
       accountAddress: "0xca843569e3427144cead5e4d5999a3d0ccf92b8e",
       accountPrivateKey:
-        "4762e04d10832808a0aebdaa79c12de54afbe006bfffd228b3abcc494fe986f9",
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
     },
     member3: {
       name: "member3",
