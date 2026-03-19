@@ -20,9 +20,12 @@ PADRAO_ENDERECO = re.compile(r"^0x[0-9a-fA-F]{40}$")
 FRAME_OUTPUT_PATH_STR = os.getenv("AUTOMATOS_FRAME_PATH", "").strip()
 FRAME_OUTPUT_PATH: Optional[Path] = None
 TRECHOS_DIR = BASE_DIR / "trechos_nao_conformes"
-PRE_EVENT_SECONDS = float(os.getenv("NC_PRE_SECONDS", "5"))
-POST_EVENT_SECONDS = float(os.getenv("NC_POST_SECONDS", "5"))
+PRE_EVENT_SECONDS = float(os.getenv("NC_PRE_SECONDS", "3"))
+POST_EVENT_SECONDS = float(os.getenv("NC_POST_SECONDS", "1"))
 MAX_EVENT_SECONDS = float(os.getenv("NC_MAX_SECONDS", "20"))
+DISPLAY_FPS = float(os.getenv("AUTOMATOS_DISPLAY_FPS", "12"))
+ANALYSIS_FPS = float(os.getenv("AUTOMATOS_ANALYSIS_FPS", "8"))
+MEASUREMENT_SECONDS = float(os.getenv("AUTOMATOS_MEASUREMENT_SECONDS", "20"))
 if FRAME_OUTPUT_PATH_STR:
     try:
         FRAME_OUTPUT_PATH = Path(FRAME_OUTPUT_PATH_STR)
@@ -128,14 +131,19 @@ class NonConformityClipper:
         self.max_seconds = max(1.0, max_seconds)
         self.fps = fps if fps and fps > 0 else 30.0
         self.blockchain_client = blockchain_client if blockchain_client and blockchain_client.enabled else None
-        self.recent_frames = deque()
         self.event_open = False
         self.event_reason = ""
         self.event_reasons = set()
-        self.event_frames = []
         self.last_active_ts = 0.0
-        self.last_event_start_ts = 0.0
-        self._last_appended_ts = None
+        self.last_seen_ts = 0.0
+        self.clip_start_ts = 0.0
+        self.clip_output_path: Optional[Path] = None
+        self.clip_writer = None
+        self.clip_frame_count = 0
+        self.clip_last_written_ts: Optional[float] = None
+        self.clip_counter = 0
+        self.recent_frames = deque()
+        self.max_recent_frames = max(1, int(round(self.pre_seconds * self.fps)) + 2)
 
         self.enabled = self.source_path is not None
         if self.enabled:
@@ -155,98 +163,140 @@ class NonConformityClipper:
         texto = re.sub(r"[^a-z0-9_]+", "", texto)
         return texto or "nao_conformidade"
 
+    def _make_output_path(self, reason: str, start_sec: float) -> Path:
+        reason_slug = self._sanitize_label("_".join(sorted(self.event_reasons or {reason})))
+        start_tag = int(max(0.0, start_sec) * 1000)
+        source_stem = self._sanitize_label(self.source_path.stem if self.source_path else "video")
+        self.clip_counter += 1
+        return self.output_dir / f"trecho_{source_stem}_{reason_slug}_{start_tag}_{self.clip_counter:03d}.mp4"
+
+    def _finalize_output_path(self, output_path: Path) -> Path:
+        reason_slug = self._sanitize_label("_".join(sorted(self.event_reasons or {"nao_conformidade"})))
+        start_tag = int(max(0.0, self.clip_start_ts) * 1000)
+        source_stem = self._sanitize_label(self.source_path.stem if self.source_path else "video")
+        final_path = self.output_dir / f"trecho_{source_stem}_{reason_slug}_{start_tag}_{self.clip_counter:03d}.mp4"
+        if final_path == output_path:
+            return output_path
+        try:
+            os.replace(output_path, final_path)
+            return final_path
+        except OSError as exc:
+            self._log(f"falha ao renomear trecho '{output_path.name}': {exc}")
+            return output_path
+
     def _append_recent(self, timestamp_sec: float, frame) -> None:
-        frame_copy = frame.copy()
-        self.recent_frames.append((timestamp_sec, frame_copy))
-        cutoff = timestamp_sec - self.pre_seconds
-        while self.recent_frames and self.recent_frames[0][0] < cutoff:
+        self.recent_frames.append((timestamp_sec, frame.copy()))
+        while len(self.recent_frames) > self.max_recent_frames:
+            self.recent_frames.popleft()
+        min_ts = max(0.0, timestamp_sec - self.pre_seconds)
+        while self.recent_frames and self.recent_frames[0][0] < min_ts:
             self.recent_frames.popleft()
 
-    def _append_event_frame(self, timestamp_sec: float, frame) -> None:
-        if self._last_appended_ts is not None and timestamp_sec <= self._last_appended_ts:
-            return
-        self.event_frames.append((timestamp_sec, frame.copy()))
-        self._last_appended_ts = timestamp_sec
+    def _open_writer(self, frame, output_path: Path) -> bool:
+        import cv2
 
-    def _start_event(self, timestamp_sec: float, reason: str) -> None:
+        height, width = frame.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        self.clip_writer = cv2.VideoWriter(str(output_path), fourcc, self.fps, (width, height))
+        if not self.clip_writer.isOpened():
+            self.clip_writer = None
+            self._log(f"falha ao abrir writer para '{output_path.name}'")
+            return False
+        self.clip_output_path = output_path
+        self.clip_frame_count = 0
+        self.clip_last_written_ts = None
+        return True
+
+    def _write_frame(self, timestamp_sec: float, frame) -> None:
+        if self.clip_writer is None:
+            return
+        if self.clip_last_written_ts is not None and abs(timestamp_sec - self.clip_last_written_ts) < 1e-6:
+            return
+        self.clip_writer.write(frame)
+        self.clip_frame_count += 1
+        self.clip_last_written_ts = timestamp_sec
+
+    def _start_event(self, timestamp_sec: float, frame, reason: str, continued: bool = False) -> None:
         self.event_open = True
         self.event_reason = reason
         self.event_reasons = {reason}
         self.last_active_ts = timestamp_sec
-        self.last_event_start_ts = timestamp_sec
-        self.event_frames = [(ts, frm.copy()) for ts, frm in self.recent_frames]
-        self._last_appended_ts = self.event_frames[-1][0] if self.event_frames else None
+        self.last_seen_ts = timestamp_sec
+        self.clip_start_ts = timestamp_sec if continued else max(0.0, timestamp_sec - self.pre_seconds)
+        output_path = self._make_output_path(reason, self.clip_start_ts)
+        if not self._open_writer(frame, output_path):
+            self.event_open = False
+            self.event_reason = ""
+            self.event_reasons = set()
+            return
+        if continued:
+            self._log(f"continuando gravacao em novo trecho a partir de {self.clip_start_ts:.2f}s por motivo: {reason}")
+            self._write_frame(timestamp_sec, frame)
+            return
+
         self._log(f"iniciando gravacao do trecho em {timestamp_sec:.2f}s por motivo: {reason}")
+        for buffered_ts, buffered_frame in self.recent_frames:
+            if buffered_ts >= self.clip_start_ts:
+                self._write_frame(buffered_ts, buffered_frame)
 
-    def _save_event(self) -> Optional[Path]:
-        import cv2
-
-        if not self.event_frames:
-            return None
-        first_frame = self.event_frames[0][1]
-        if first_frame is None:
-            return None
-        height, width = first_frame.shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        reason_slug = self._sanitize_label("_".join(sorted(self.event_reasons)))
-        start_tag = int(max(0.0, self.last_event_start_ts) * 1000)
-        source_stem = self._sanitize_label(self.source_path.stem if self.source_path else "fonte")
-        output_path = self.output_dir / f"trecho_{source_stem}_{reason_slug}_{start_tag}.mp4"
-        writer = cv2.VideoWriter(str(output_path), fourcc, self.fps, (width, height))
-        if not writer.isOpened():
-            self._log(f"falha ao abrir writer para '{output_path.name}'")
-            return None
-        try:
-            for _, frame in self.event_frames:
-                writer.write(frame)
-        finally:
-            writer.release()
-        self._log(f"trecho salvo em '{output_path.name}' com {len(self.event_frames)} frames")
-        return output_path
-
-    def _close_event(self) -> None:
-        output_path = self._save_event()
-        if output_path and self.blockchain_client:
-            descricao = f"Trecho nao conforme: {', '.join(sorted(self.event_reasons))}"
-            self.blockchain_client.register_file(output_path, descricao)
+    def _reset_clip_state(self) -> None:
         self.event_open = False
         self.event_reason = ""
         self.event_reasons = set()
-        self.event_frames = []
-        self._last_appended_ts = None
+        self.clip_writer = None
+        self.clip_output_path = None
+        self.clip_frame_count = 0
+        self.clip_last_written_ts = None
+
+    def _close_event(self, end_sec: float) -> None:
+        output_path = self.clip_output_path
+        writer = self.clip_writer
+        written_frames = self.clip_frame_count
+        if writer is not None:
+            writer.release()
+        if output_path:
+            output_path = self._finalize_output_path(output_path)
+            self._log(
+                f"trecho salvo em '{output_path.name}' de {self.clip_start_ts:.2f}s ate {end_sec:.2f}s com {written_frames} frames"
+            )
+            if self.blockchain_client:
+                descricao = f"Trecho nao conforme: {', '.join(sorted(self.event_reasons))}"
+                self.blockchain_client.register_file(output_path, descricao)
+        self._reset_clip_state()
 
     def _rotate_event(self, timestamp_sec: float, frame, reason: Optional[str]) -> None:
         self._log(f"duracao maxima de {self.max_seconds:.1f}s atingida; salvando trecho e iniciando novo.")
-        self._close_event()
+        self._close_event(self.clip_start_ts + self.max_seconds)
         if reason:
-            self._start_event(timestamp_sec, reason)
-            self._append_event_frame(timestamp_sec, frame)
+            self._start_event(timestamp_sec, frame, reason, continued=True)
 
     def ingest(self, timestamp_sec: float, frame, reason: Optional[str]) -> None:
         if not self.enabled:
             return
+        self.last_seen_ts = timestamp_sec
         self._append_recent(timestamp_sec, frame)
         if reason and not self.event_open:
-            self._start_event(timestamp_sec, reason)
+            self._start_event(timestamp_sec, frame, reason)
         if self.event_open:
             if reason:
                 if reason not in self.event_reasons:
                     self._log(f"gravacao em andamento; novo motivo detectado: {reason}")
                 self.event_reasons.add(reason)
                 self.last_active_ts = timestamp_sec
-            self._append_event_frame(timestamp_sec, frame)
-            if timestamp_sec - self.last_event_start_ts >= self.max_seconds:
+            if self.clip_writer is not None:
+                self._write_frame(timestamp_sec, frame)
+            if timestamp_sec - self.clip_start_ts >= self.max_seconds:
                 self._rotate_event(timestamp_sec, frame, reason)
                 return
             if (not reason) and (timestamp_sec - self.last_active_ts >= self.post_seconds):
                 self._log(f"nao conformidade encerrada em {timestamp_sec:.2f}s")
-                self._close_event()
+                self._close_event(self.last_active_ts + self.post_seconds)
 
     def finish(self) -> None:
         if not self.enabled or not self.event_open:
             return
         self._log("fim do video com nao conformidade ainda aberta; salvando trecho final.")
-        self._close_event()
+        self._close_event(self.last_seen_ts)
 
 
 class BlockchainClient:
@@ -602,6 +652,17 @@ def _gen_from_image(model, path):
     return [(objetos, boxes)]
 
 
+def _format_seconds_label(value: Optional[float]) -> str:
+    if value is None or value < 0:
+        return "--:--"
+    total = int(value)
+    minutes, seconds = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
 def _stream_from_capture(model, cap, afn, clipper: Optional[NonConformityClipper] = None):
     import cv2
     import numpy as np
@@ -630,16 +691,22 @@ def _stream_from_capture(model, cap, afn, clipper: Optional[NonConformityClipper
     frame_output_path = FRAME_OUTPUT_PATH
     frame_notice_emitted = False
     frame_error_reported = False
+    last_frame_publish_ts = 0.0
 
     def _publish_frame(image):
-        nonlocal frame_notice_emitted, frame_error_reported
+        nonlocal frame_notice_emitted, frame_error_reported, last_frame_publish_ts
         if not frame_output_path:
+            return
+        now = time.time()
+        min_interval = 1.0 / DISPLAY_FPS if DISPLAY_FPS > 0 else 0.0
+        if min_interval > 0 and (now - last_frame_publish_ts) < min_interval:
             return
         tmp_path = frame_output_path.parent / f".{frame_output_path.name}.tmp"
         try:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             Image.fromarray(rgb).save(tmp_path, format="JPEG")
             os.replace(tmp_path, frame_output_path)
+            last_frame_publish_ts = now
             if not frame_notice_emitted:
                 frame_notice_emitted = True
                 print(f"[frames] enviando visualiza��o para {frame_output_path}")
@@ -653,7 +720,7 @@ def _stream_from_capture(model, cap, afn, clipper: Optional[NonConformityClipper
             except Exception:
                 pass
 
-    def _draw_overlays(img, boxes, labels, state):
+    def _draw_overlays(img, boxes, labels, state, elapsed_sec: Optional[float] = None):
         colors = {
             "amostra": (0, 255, 255),
             "cesta": (255, 165, 0),
@@ -691,6 +758,18 @@ def _stream_from_capture(model, cap, afn, clipper: Optional[NonConformityClipper
                 2,
                 cv2.LINE_AA,
             )
+            if elapsed_sec is not None:
+                tempo_texto = f"Tempo: {_format_seconds_label(elapsed_sec)} / {_format_seconds_label(total_duration_sec)}"
+                cv2.putText(
+                    img,
+                    tempo_texto,
+                    (10, 62),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.85,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
         except Exception:
             pass
         return img
@@ -698,31 +777,62 @@ def _stream_from_capture(model, cap, afn, clipper: Optional[NonConformityClipper
     warned_fallback = False
     fps = cap.get(cv2.CAP_PROP_FPS)
     fps = fps if fps and fps > 0 else 30.0
+    analysis_stride = max(1, int(round(fps / ANALYSIS_FPS))) if ANALYSIS_FPS > 0 else 1
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    total_duration_sec: Optional[float] = None
+    if total_frames and total_frames > 0 and fps > 0:
+        total_duration_sec = total_frames / fps
+    playback_start_wall = time.time()
+    playback_start_video_ts: Optional[float] = None
     frame_index = 0
+    current_measurement_index = 1
+    next_measurement_boundary = MEASUREMENT_SECONDS if MEASUREMENT_SECONDS > 0 else None
+    last_boxes = []
+    last_objetos = []
+    last_processed_frame = 0
     while True:
         ok, frame = cap.read()
         if not ok:
+            print("[info] Fim do vídeo. Execução encerrada; escolha executar novamente ou selecione outro vídeo.")
             break
         frame_index += 1
-        try:
-            res = model.track(frame, persist=True, verbose=False)
-        except Exception as e:
-            if not warned_fallback:
-                try:
-                    print("[aviso] Tracking indisponível (scipy/numpy). Usando detecção por frame. Detalhe:", str(e))
-                except Exception:
-                    pass
-                warned_fallback = True
-            res = model(frame, verbose=False)
-        if not res:
-            continue
-        r0 = res[0]
-        names = r0.names
-        boxes = r0.boxes.xyxy.cpu().tolist() if r0.boxes is not None else []
-        classes = r0.boxes.cls.tolist() if r0.boxes is not None else []
-        objetos = _normalizar_objetos([names[int(i)] for i in classes])
         timestamp_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
         timestamp_sec = (timestamp_msec / 1000.0) if timestamp_msec and timestamp_msec > 0 else (frame_index / fps)
+        if playback_start_video_ts is None:
+            playback_start_video_ts = timestamp_sec
+        target_elapsed = max(0.0, timestamp_sec - playback_start_video_ts)
+        wall_elapsed = time.time() - playback_start_wall
+        delay = target_elapsed - wall_elapsed
+        if delay > 0:
+            time.sleep(delay)
+        if next_measurement_boundary is not None:
+            while timestamp_sec >= next_measurement_boundary:
+                print(
+                    f"[medicao] medicao {current_measurement_index} encerrada aos {next_measurement_boundary:.2f}s; iniciando medicao {current_measurement_index + 1}."
+                )
+                current_measurement_index += 1
+                next_measurement_boundary += MEASUREMENT_SECONDS
+        should_run_inference = (frame_index == 1) or ((frame_index - last_processed_frame) >= analysis_stride)
+        if should_run_inference:
+            try:
+                res = model.track(frame, persist=True, verbose=False)
+            except Exception as e:
+                if not warned_fallback:
+                    try:
+                        print("[aviso] Tracking indisponível (scipy/numpy). Usando detecção por frame. Detalhe:", str(e))
+                    except Exception:
+                        pass
+                    warned_fallback = True
+                res = model(frame, verbose=False)
+            if res:
+                r0 = res[0]
+                names = r0.names
+                last_boxes = r0.boxes.xyxy.cpu().tolist() if r0.boxes is not None else []
+                classes = r0.boxes.cls.tolist() if r0.boxes is not None else []
+                last_objetos = _normalizar_objetos([names[int(i)] for i in classes])
+                last_processed_frame = frame_index
+        boxes = last_boxes
+        objetos = last_objetos
         critical_reason = detectar_nao_conformidade_critica(objetos)
         if clipper:
             clipper.ingest(timestamp_sec, frame, critical_reason)
@@ -733,7 +843,7 @@ def _stream_from_capture(model, cap, afn, clipper: Optional[NonConformityClipper
 
         if SHOW_GUI or frame_output_path:
             try:
-                annotated = _draw_overlays(frame.copy(), boxes, objetos, afn.estado_atual)
+                annotated = _draw_overlays(frame.copy(), boxes, objetos, afn.estado_atual, timestamp_sec)
                 disp = _letterbox_display(annotated)
                 if SHOW_GUI:
                     cv2.imshow(WIN, disp)

@@ -56,6 +56,17 @@ def _prepare_frame_output() -> tuple[Path, FrameWatcher]:
     return frame_path, watcher
 
 
+def _cleanup_frame_output(frame_watcher: Optional[FrameWatcher]) -> None:
+    if not frame_watcher:
+        return
+    try:
+        frame_watcher.frame_path.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
 def _image_to_numpy(img: Image.Image) -> "np.ndarray":
     """Converte imagem PIL em array RGB (uint8) para o Gradio."""
     arr = np.array(img, copy=True)
@@ -83,6 +94,46 @@ def _relative_to_base(path: Path) -> str:
     except ValueError:
         return str(path)
     return str(rel)
+
+
+def _discover_model_choices() -> tuple[list[tuple[str, str]], str]:
+    search_roots = [BASE_DIR, BASE_DIR.parent]
+    seen: set[Path] = set()
+    found: list[Path] = []
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*.pt"):
+            if not path.is_file():
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            found.append(resolved)
+
+    def _sort_key(path: Path) -> tuple[int, str]:
+        preferred = 0 if path.name == "ModeloTreinadoV3.pt" else 1
+        return (preferred, path.name.lower(), str(path).lower())
+
+    found.sort(key=_sort_key)
+
+    choices: list[tuple[str, str]] = []
+    default_value = ""
+    for path in found:
+        try:
+            rel_to_parent = path.relative_to(BASE_DIR.parent)
+            label = str(rel_to_parent)
+        except ValueError:
+            label = path.name
+        value = os.path.relpath(path, BASE_DIR)
+        choices.append((label, value))
+        if not default_value and path.name == "ModeloTreinadoV3.pt":
+            default_value = value
+
+    if not default_value and choices:
+        default_value = choices[0][1]
+    return choices, default_value
 
 
 def _stream_process(
@@ -157,16 +208,14 @@ def _stream_process(
         except Exception:
             ret = 'desconhecido'
         buffer += f"\nProcesso encerrado (codigo {ret})."
-        yield buffer, current_image
+        _cleanup_frame_output(frame_watcher)
+        yield buffer, None
         return
 
     ret = proc.wait()
     buffer += f"\nProcesso finalizado com codigo {ret}."
-    if frame_watcher:
-        final_image = frame_watcher.poll()
-        if final_image is not None:
-            current_image = final_image
-    yield buffer, current_image
+    _cleanup_frame_output(frame_watcher)
+    yield buffer, None
 
 def executar(
     mode: str,
@@ -229,6 +278,7 @@ def parar(log_atual: str) -> str:
 
 
 with gr.Blocks(title="Automatos - Controle") as demo:
+    model_choices, default_model = _discover_model_choices()
     gr.Markdown(
         "## Automatos (Gradio)\n"
         "Execute o pipeline `automatos.py` ou `mock.py`, enviando vídeos/imagens "
@@ -263,10 +313,12 @@ with gr.Blocks(title="Automatos - Controle") as demo:
         file_count="single",
         file_types=["video", "image"],
     )
-    model_box = gr.Textbox(
-        value="ModeloTreinadoV3.pt",
+    model_box = gr.Dropdown(
+        choices=model_choices,
+        value=default_model,
         label="Modelo (.pt)",
-        placeholder="Opcional - usa autodetecção se vazio",
+        info="Escolha um modelo encontrado no projeto ou digite um caminho customizado",
+        allow_custom_value=True,
     )
     executar_btn = gr.Button("Executar")
     parar_btn = gr.Button("Parar", variant="stop")
